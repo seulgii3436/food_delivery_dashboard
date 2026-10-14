@@ -16,19 +16,60 @@ st.title("사용자 행동 탐색 대시보드")
 st.caption("주별 세션 퍼널 | 플랫폼 · 유입 경로별 | 2025.07 ~ 2026.06")
 
 # ------------------------------------------------------------
-# 0. 필요한 데이터만 추출 — 쓸 테이블과 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 처음 한 번만 만듦
+# 업로드된 파일 확인 및 데이터 파일 선택 처리 (캐시 함수 밖에서 수행)
 # ------------------------------------------------------------
-DATA_DIR = "data"                         # 원본 CSV를 넣어 둔 폴더
-NEEDED = {                                # 이번 대시보드에 필요한 테이블과 컬럼
+DATA_DIR = "data"
+NEEDED = {
     "app_events": ["event_id", "event_datetime", "customer_id", "session_id",
                    "event_name", "platform", "traffic_source"],
 }
 
+uploaded_file = st.session_state.get("upload_file", None)
+current_file_name = uploaded_file.name if uploaded_file is not None else None
+
+# 파일 변경 감지 및 필터 초기화 처리
+if "last_uploaded_file_name" not in st.session_state:
+    st.session_state["last_uploaded_file_name"] = current_file_name
+
+if st.session_state["last_uploaded_file_name"] != current_file_name:
+    st.session_state["last_uploaded_file_name"] = current_file_name
+    if "filter_version" in st.session_state:
+        st.session_state["filter_version"] += 1
+
+file_bytes = None
+data_source_label = "data 폴더 기본 파일"
+
+if uploaded_file is not None:
+    try:
+        # 업로드된 파일 읽기 (임시 저장 없이 바이트로 처리)
+        file_bytes = uploaded_file.getvalue()
+        # 임시로 pandas로 읽어 컬럼 확인
+        uploaded_df_preview = pd.read_csv(pd.io.common.BytesIO(file_bytes), nrows=0)
+        missing_cols = [col for col in NEEDED["app_events"] if col not in uploaded_df_preview.columns]
+        
+        if missing_cols:
+            st.error(f"업로드된 파일에 필요한 컬럼이 없습니다: {', '.join(missing_cols)}. 기본 데이터로 표시합니다.")
+            file_bytes = None
+            data_source_label = "data 폴더 기본 파일"
+        else:
+            data_source_label = f"올린 파일 {uploaded_file.name}"
+    except Exception as e:
+        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}. 기본 데이터로 표시합니다.")
+        file_bytes = None
+        data_source_label = "data 폴더 기본 파일"
+
+# ------------------------------------------------------------
+# 0. 필요한 데이터만 추출 — 쓸 테이블과 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 처음 한 번만 만듦
+# ------------------------------------------------------------
 @st.cache_resource
-def get_db():                             # 필요한 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 만듦 (처음 한 번만)
+def get_db(f_bytes):                             # 필요한 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 만듦 (처음 한 번만)
     con = sqlite3.connect(":memory:", check_same_thread=False)
     for name, cols in NEEDED.items():
-        pd.read_csv(f"{DATA_DIR}/{name}.csv", usecols=cols).to_sql(name, con, index=False)
+        if f_bytes is not None:
+            df_src = pd.read_csv(pd.io.common.BytesIO(f_bytes), usecols=cols)
+        else:
+            df_src = pd.read_csv(f"{DATA_DIR}/{name}.csv", usecols=cols)
+        df_src.to_sql(name, con, index=False)
     # 5주차 제외 규칙: QA 계정 제외 · 중복 이벤트 제거
     con.execute("""
         CREATE TABLE events AS
@@ -48,8 +89,8 @@ def get_db():                             # 필요한 컬럼만 메모리 DB에 
 # 1. 데이터 준비 — 정제된 events 테이블을 SQL로 집계
 # ------------------------------------------------------------
 @st.cache_data
-def query(sql):                           # SQL을 실행해 표로 돌려줌
-    return pd.read_sql(sql, get_db())
+def query(sql, f_bytes):                           # SQL을 실행해 표로 돌려줌
+    return pd.read_sql(sql, get_db(f_bytes))
 
 # 주 × 플랫폼 × 유입 경로별 세션 퍼널
 SQL_WEEKLY_FUNNEL = """
@@ -76,12 +117,12 @@ SELECT s.주시작일,
 """
 
 @st.cache_data
-def load_data():
-    data = query(SQL_WEEKLY_FUNNEL)
+def load_data(f_bytes):
+    data = query(SQL_WEEKLY_FUNNEL, f_bytes)
     data["주시작일"] = pd.to_datetime(data["주시작일"]).dt.date
     return data
 
-df = load_data()                          # 주 × 플랫폼 × 유입 경로별 세션 퍼널
+df = load_data(file_bytes)                          # 주 × 플랫폼 × 유입 경로별 세션 퍼널
 
 AI_NOTES = {
 "전체": "전체 세션 수는 28,840개이며 주문 전환율은 14.5%, 가장 낮은 단계 전환율은 장바구니 단계의 41.4%이다. 전체 기간 동안 플랫폼과 경로별로 전환 성과에 차이가 나타난 것으로 보인다.",
@@ -109,15 +150,16 @@ v = st.session_state["filter_version"]
 
 st.sidebar.header("필터")
 
-weeks = sorted(df["주시작일"].unique())
+weeks = sorted(df["주시작일"].unique()) if not df.empty else []
+default_period = (weeks[0], weeks[-1]) if weeks else (None, None)
 selected_period = st.sidebar.select_slider(
     "기간",
-    options=weeks,
-    value=(weeks[0], weeks[-1]),
+    options=weeks if weeks else [None],
+    value=default_period,
     key=f"period_{v}"
 )
 
-platforms = sorted(df["플랫폼"].unique())
+platforms = sorted(df["플랫폼"].unique()) if not df.empty else []
 selected_platforms = st.sidebar.multiselect(
     "플랫폼",
     options=platforms,
@@ -125,7 +167,7 @@ selected_platforms = st.sidebar.multiselect(
     key=f"platforms_{v}"
 )
 
-traffic_sources = sorted(df["유입경로"].unique())
+traffic_sources = sorted(df["유입경로"].unique()) if not df.empty else []
 selected_traffic_sources = st.sidebar.multiselect(
     "유입 경로",
     options=traffic_sources,
@@ -134,12 +176,12 @@ selected_traffic_sources = st.sidebar.multiselect(
 )
 
 # 평소 범위 기준 기간 선택 슬라이더 및 세션 500개 미만 집단 제외 체크박스를 고급 설정 expander 안으로 이동
-default_baseline_end_idx = min(25, len(weeks) - 1)
+default_baseline_end_idx = min(25, len(weeks) - 1) if weeks else 0
 with st.sidebar.expander("고급 설정"):
     baseline_period = st.select_slider(
         "평소 범위 기준 기간",
-        options=weeks,
-        value=(weeks[0], weeks[default_baseline_end_idx]),
+        options=weeks if weeks else [None],
+        value=(weeks[0], weeks[default_baseline_end_idx]) if weeks else (None, None),
         help="문제가 없던 기간을 고르세요. 이 기간의 주별 주 범위를 '평소 범위'로 씁니다.",
         key=f"baseline_{v}"
     )
@@ -153,13 +195,13 @@ with st.sidebar.expander("고급 설정"):
 g = df[
     (df["플랫폼"].isin(selected_platforms)) &
     (df["유입경로"].isin(selected_traffic_sources))
-]
+] if not df.empty else df
 
 # 기존 f는 g에 기간 조건을 더해 만듦
 f = g[
     (g["주시작일"] >= selected_period[0]) &
     (g["주시작일"] <= selected_period[1])
-]
+] if not g.empty and selected_period[0] is not None and selected_period[1] is not None else g
 
 # ------------------------------------------------------------
 # 사이드바 데이터 다운로드 버튼 영역 추가
@@ -191,7 +233,7 @@ with dl_col2:
 # ------------------------------------------------------------
 # 1. 제목 아래(탭 위) 보고 있는 조건 표시
 # ------------------------------------------------------------
-if len(selected_period) == 2:
+if selected_period and len(selected_period) == 2 and selected_period[0] is not None:
     period_str = f"{selected_period[0]} ~ {selected_period[1]}"
 else:
     period_str = "선택 없음"
@@ -210,16 +252,24 @@ elif len(selected_traffic_sources) == 0:
 else:
     traffic_str = ", ".join(selected_traffic_sources)
 
-st.caption(f"🔎 보고 있는 조건: 기간 ({period_str}) · 플랫폼 ({platform_str}) · 유입 경로 ({traffic_str})")
+st.caption(f"🔎 보고 있는 조건: 데이터 ({data_source_label}) · 기간 ({period_str}) · 플랫폼 ({platform_str}) · 유입 경로 ({traffic_str})")
+
+# ------------------------------------------------------------
+# 화면 탭 구성 (개요, 탐색, 액션, 데이터 업로드)
+# ------------------------------------------------------------
+tab_overview, tab_explore, tab_action, tab_upload = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션", "📤 데이터 업로드"])
+
+with tab_upload:
+    st.caption("이 탭에서는 분석에 사용할 app_events.csv 파일을 직접 업로드할 수 있습니다.")
+    st.file_uploader("app_events.csv 올리기", type="csv", key="upload_file")
+    if uploaded_file is not None:
+        st.success(f"현재 업로드된 파일: {uploaded_file.name}")
+    else:
+        st.info("파일을 업로드하지 않으면 기본 데이터(data 폴더)를 사용합니다.")
 
 if f.empty:
     st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 바꿔 주세요.")
     st.stop()
-
-# ------------------------------------------------------------
-# 화면 탭 구성 (개요, 탐색, 액션)
-# ------------------------------------------------------------
-tab_overview, tab_explore, tab_action = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션"])
 
 with tab_overview:
     st.caption("이 탭에서는 전체 핵심 지표(KPI)와 주요 전환 성과 흐름을 확인할 수 있습니다.")
@@ -590,9 +640,9 @@ with tab_action:
     df_period_only = df[
         (df["주시작일"] >= selected_period[0]) &
         (df["주시작일"] <= selected_period[1])
-    ]
+    ] if not df.empty and selected_period[0] is not None else df
     
-    action_selected_weeks = sorted(df_period_only["주시작일"].unique())
+    action_selected_weeks = sorted(df_period_only["주시작일"].unique()) if not df_period_only.empty else []
     if len(action_selected_weeks) >= 4:
         action_last_4_weeks = action_selected_weeks[-4:]
         df_last4 = df_period_only[df_period_only["주시작일"].isin(action_last_4_weeks)]
